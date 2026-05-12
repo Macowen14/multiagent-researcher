@@ -30,7 +30,7 @@ class LLMFactory:
             from langchain_openai import ChatOpenAI
 
             # Default to gpt-4o if no model is explicitly passed or set in environment
-            model = model_name or os.getenv("OPENAI_MODEL", "gpt-4o")
+            model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
             logger.info(f"Initializing OpenAI LLM with model: {model}")
 
             return ChatOpenAI(model=model, temperature=temperature)

@@ -3,7 +3,6 @@ from typing import List, Annotated
 from langchain_core.tools import tool
 from langchain_community.document_loaders import WebBaseLoader
 
-# Import Tavily search tool (requires TAVILY_API_KEY environment variable)
 from langchain_community.tools.tavily_search import TavilySearchResults
 
 # Import DuckDuckGo search (the user confirmed module is ddgs)

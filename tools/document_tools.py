@@ -24,10 +24,27 @@ def read_document(
     start: Annotated[Optional[int], "The start line, Default is 0"] = None,
     end: Annotated[Optional[int], "The end of the line. Default is none"] = None
 ) -> str:
-    """Read the specified document contents"""
+    """Read the specified document contents. Creates file with intelligent name if it doesn't exist."""
     file_to_use = make_file_path(file_name)
     if not os.path.exists(file_to_use):
-        return f"Error: File {file_name} does not exist."
+        # Create intelligent filename if file doesn't exist
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Extract meaningful name from requested filename
+        base_name = os.path.splitext(os.path.basename(file_name))[0]
+        if not base_name or base_name == file_name:
+            base_name = "untitled"
+        
+        # Create new filename with timestamp
+        new_filename = f"{base_name}_created_{timestamp}.md"
+        new_filepath = make_file_path(new_filename)
+        
+        # Create the file with a header
+        header = f"# {base_name.replace('_', ' ').title()}\n\n*Created automatically on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
+        safe_write_to_file(new_filename, header)
+        
+        return f"File '{file_name}' did not exist. Created new file '{new_filename}' with intelligent naming."
         
     try:
         # We grab the lock even when reading so we don't read a half-written file!
@@ -55,10 +72,14 @@ def edit_document(
     filename: Annotated[str, "File path to save the document"],
     inserts: Annotated[Dict[int, str], "Dictionary where key is the line number and the value is the text to be inserted at the line"]
 ) -> str:
-    """Edit a document by inserting text at specified line numbers"""
+    """Edit a document by inserting text at specified line numbers. Creates file if it doesn't exist."""
     file_to_use = make_file_path(filename)
     if not os.path.exists(file_to_use):
-        return f"Error: File {filename} does not exist."
+        # Create the file first if it doesn't exist
+        import datetime
+        base_name = os.path.splitext(os.path.basename(filename))[0]
+        header = f"# {base_name.replace('_', ' ').title()}\n\n*Created automatically on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
+        safe_write_to_file(filename, header)
         
     try:
         # Wrap both the read and the write inside the lock

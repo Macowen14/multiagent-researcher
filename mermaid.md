@@ -15,9 +15,10 @@ graph TD
     START((START))
     END((END))
     
-    Supervisor[Supervisor Node\nDecides Next Route]:::supervisor
+    Supervisor[Intelligent Supervisor\nDecides Next Route]:::supervisor
     
     Researcher[Researcher Agent]:::worker
+    Analyst[Analyst Agent]:::worker
     Writer[Writer Agent]:::worker
     
     %% Tool Boxes
@@ -25,6 +26,15 @@ graph TD
         T1[search_tavily]:::tools
         T2[search_ddg]:::tools
         T3[scrape_webpages]:::tools
+    end
+    
+    subgraph Enhanced Web Tools
+        E1[enhanced_search_tavily]:::tools
+        E2[search_wikipedia]:::tools
+        E3[search_arxiv]:::tools
+        E4[search_github]:::tools
+        E5[search_stackoverflow]:::tools
+        E6[get_tool_references]:::tools
     end
     
     subgraph Document Tools
@@ -37,14 +47,23 @@ graph TD
     %% Routing edges
     START --> Supervisor
     
-    Supervisor --"Routes to Researcher"--> Researcher
-    Supervisor --"Routes to Writer"--> Writer
-    Supervisor --"Job Complete"--> END
+    Supervisor --"1. Routes to Researcher"--> Researcher
+    Supervisor --"2. Routes to Analyst"--> Analyst
+    Supervisor --"3. Routes to Writer"--> Writer
+    Supervisor --"4. Job Complete"--> END
     
     %% Worker to Tools
     Researcher -. "Calls" .-> T1
     Researcher -. "Calls" .-> T2
     Researcher -. "Calls" .-> T3
+    Researcher -. "Calls" .-> E1
+    Researcher -. "Calls" .-> E2
+    Researcher -. "Calls" .-> E3
+    Researcher -. "Calls" .-> E4
+    Researcher -. "Calls" .-> E5
+    Researcher -. "Calls" .-> E6
+    
+    Analyst -. "Calls" .-> E6
     
     Writer -. "Calls" .-> D1
     Writer -. "Calls" .-> D2
@@ -53,14 +72,15 @@ graph TD
     
     %% Workers return control back to supervisor
     Researcher --"Updates State & Returns"--> Supervisor
+    Analyst --"Updates State & Returns"--> Supervisor
     Writer --"Updates State & Returns"--> Supervisor
 ```
 
 ## How the Flow Works
 1. Execution starts at **START** and flows immediately to the **Supervisor**.
-2. The **Supervisor** reads the `MessagesState` array. It uses its LLM strictly to decide if it should call the Researcher or the Writer.
-3. If it calls the **Researcher Agent**, that agent is given a specific internal prompt and uses its **Web Tools** to fetch data.
-4. Once the Researcher finishes, it appends its results to the global `MessagesState` array and returns control back to the **Supervisor**.
-5. The **Supervisor** reads the new state. It sees the research is done, so it routes to the **Writer Agent**.
-6. The Writer Agent uses its **Document Tools** (which are protected by atomic locks) to create files. It appends its final message to the state and returns control.
+2. The **Supervisor** implements an Intelligent Routing Strategy. For a new request, it routes to the **Researcher Agent**.
+3. The **Researcher Agent** uses its standard and enhanced web tools to fetch comprehensive data from the web, GitHub, arXiv, etc. It appends its results and returns control.
+4. The **Supervisor** reads the state and routes to the **Analyst Agent** to identify information gaps and evaluate quality.
+5. If the **Analyst** finds gaps, the **Supervisor** may route back to the **Researcher**. If the research is approved, it routes to the **Writer Agent**.
+6. The **Writer Agent** uses its **Document Tools** to organize and save the final files securely.
 7. The **Supervisor** sees the final documents are written and routes to **END**, finishing the application.
