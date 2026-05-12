@@ -5,7 +5,6 @@ from langchain_community.document_loaders import WebBaseLoader
 
 from langchain_community.tools.tavily_search import TavilySearchResults
 
-# Import DuckDuckGo search (the user confirmed module is ddgs)
 from ddgs import DDGS
 
 logger = logging.getLogger(__name__)
