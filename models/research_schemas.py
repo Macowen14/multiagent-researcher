@@ -107,7 +107,7 @@ class ResearchReport(BaseModel):
 
 class AnalysisReport(BaseModel):
     """Structured analysis report for the analyst agent."""
-    research_report: ResearchReport = Field(..., description="Research report to analyze")
+    research_report: Optional[ResearchReport] = Field(default=None, description="Research report to analyze")
     quality_assessment: str = Field(..., description="Overall quality assessment")
     completeness_score: float = Field(..., ge=0.0, le=1.0, description="How complete the research is")
     reliability_score: float = Field(..., ge=0.0, le=1.0, description="Reliability of sources")

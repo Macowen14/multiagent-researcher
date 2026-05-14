@@ -29,6 +29,61 @@ from models.research_schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _stringify_source_content(source: Dict[str, Any]) -> str:
+    content = source.get("content") or source.get("snippet") or source.get("summary")
+    if content:
+        return str(content)
+
+    useful_fields = {
+        key: value
+        for key, value in source.items()
+        if key not in {"url", "html_url"} and value not in (None, "", [])
+    }
+    return json.dumps(useful_fields, ensure_ascii=False)
+
+
+def _normalize_sources(sources_data: Any) -> List[Dict[str, Any]]:
+    """Accept flat or grouped source JSON and return title/url/content records."""
+    if isinstance(sources_data, dict):
+        sources_data = (
+            sources_data.get("sources") or sources_data.get("details") or [sources_data]
+        )
+
+    normalized = []
+    for source in sources_data or []:
+        if not isinstance(source, dict):
+            continue
+
+        source_label = source.get("source") or source.get("type") or source.get("tool")
+        details = source.get("details")
+        detail_items = details if isinstance(details, list) else [source]
+
+        for detail in detail_items:
+            if not isinstance(detail, dict):
+                continue
+
+            title = (
+                detail.get("title")
+                or detail.get("repo")
+                or detail.get("question")
+                or detail.get("name")
+                or source_label
+                or "Unknown Title"
+            )
+            url = detail.get("url") or detail.get("html_url") or detail.get("link") or ""
+            normalized.append(
+                {
+                    **detail,
+                    "title": str(title),
+                    "url": str(url),
+                    "content": _stringify_source_content(detail),
+                    "source": source_label or detail.get("source") or detail.get("type"),
+                }
+            )
+
+    return normalized
+
+
 @tool("create_research_strategy")
 def create_research_strategy(
     query: Annotated[str, "The user's research query"],
@@ -158,7 +213,7 @@ def validate_research_sources(
     logger.info("Validating research sources")
     
     try:
-        sources_data = json.loads(sources_json)
+        sources_data = _normalize_sources(json.loads(sources_json))
         validation_response = ValidationResponse(
             is_valid=True,
             validation_score=0.0,
@@ -258,7 +313,7 @@ def create_research_report(
     logger.info(f"Creating research report for query: '{query}'")
     
     try:
-        sources_data = json.loads(sources_json)
+        sources_data = _normalize_sources(json.loads(sources_json))
         
         # Create source references
         source_references = []

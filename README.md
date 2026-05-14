@@ -1,43 +1,443 @@
-# Multi-Agent Web Research & Writing System
+# Multi-Agent Web Research and Writing System
 
-This project is a highly robust, production-ready multi-agent application built on the **LangGraph** framework. It implements a **Hierarchical Supervisor Routing Architecture** where a central LLM orchestrates specialized sub-agents (ReAct worker nodes) using strictly typed Pydantic models, custom state management, and memory checkpointing.
+This project is a LangGraph multi-agent application for researching a topic, reviewing the research, and producing a written document. It uses specialized ReAct workers for research, analysis, and writing, plus a supervisor node that routes work through the pipeline.
 
-## Architectural Deep Dive
+The current supervisor is a hybrid router:
 
-### 1. State Management (`MultiAgentState`)
-The application uses a custom `TypedDict` for its graph state (defined in `models/state.py`).
-- **`messages`**: A list of LangChain `BaseMessage` objects (`HumanMessage`, `AIMessage`, `ToolMessage`). This is managed by the LangGraph `add_messages` reducer which automatically appends new messages rather than overwriting them.
-- **Data Fields**: Custom fields like `scraped_data`, `research_report`, and `approval_status` are defined to decouple large data payloads from the conversational chat history, drastically reducing token usage and preventing `ContextWindowExceeded` errors.
+- It can use an LLM for the first route when no worker has acted yet.
+- After a known worker finishes, it uses deterministic routing rules so the same completed worker is not called again by accident.
 
-### 2. The Supervisor Node
-Located in `agents/supervisor.py`, the Supervisor acts as the routing brain. 
-- **Silent/Loud Routing**: The Supervisor reads the `MultiAgentState`, applies rules from its System Prompt, and uses `llm.with_structured_output` to force the generation of a JSON `Route` object. It does not execute tools.
-- **Explicit Handoffs**: To solve "Identity Confusion" between agents, the Supervisor injects a `HumanMessage` named "Supervisor" into the state before routing. This explicit directive ensures the worker knows exactly what to fix.
-- **State Filtering**: Before invoking the LLM, the Supervisor filters out large `ToolMessage` payloads (e.g., massive scraped HTML) replacing them with summaries. This preserves the context window.
+## Runtime Flow
 
-### 3. Worker Nodes (ReAct Agents)
-The Researcher, Analyst, and Writer are implemented via LangGraph's `create_react_agent`.
-- **Execution Loop**: Workers execute internal `while tool_calls` loops. They parse tool output, decide on the next tool, and aggregate data. They only return control to the Supervisor when they generate an `AIMessage` without a tool call.
-- **Tool Binding**: Tools are defined using the `@tool` decorator or Pydantic `BaseModel`s. LangChain compiles these into JSON schemas sent to the LLM (OpenAI/Ollama).
+Default pipeline:
 
-### 4. Checkpointing and Memory
-The `StateGraph` is compiled with `MemorySaver()`. In `main.py`, the `app.stream()` execution is bound to a `thread_id`. This grants the multi-agent system thread-level persistent memory, allowing conversational continuity across multiple user prompts.
+```text
+new user request
+-> researcher_agent
+-> analyst_agent
+-> writer_agent
+-> __end__
+```
+
+Revision path:
+
+```text
+analyst_agent + NEEDS_IMPROVEMENT
+-> researcher_agent
+-> analyst_agent
+```
+
+Completion path:
+
+```text
+analyst_agent + APPROVED
+-> writer_agent
+-> __end__
+```
+
+## Main Components
+
+### `main.py`
+
+`main.py` builds and runs the graph.
+
+Responsibilities:
+
+- Loads environment variables and API keys.
+- Creates the shared LLM through `LLMFactory`.
+- Defines worker names:
+  - `researcher_agent`
+  - `analyst_agent`
+  - `writer_agent`
+- Builds ReAct workers with their tool lists and prompts.
+- Wraps each worker node so only new messages are returned to the graph.
+- Tags worker `AIMessage` objects with the worker name.
+- Stores important outputs in graph state.
+- Compiles the graph with `MemorySaver`.
+- Runs `app.stream(...)` in a command-line loop.
+
+### `agents/supervisor.py`
+
+The supervisor decides which node runs next.
+
+For a brand-new request, the supervisor may call the LLM and request a structured route:
+
+```json
+{
+  "reason": "Why this route was selected",
+  "next": "researcher_agent | analyst_agent | writer_agent | __end__"
+}
+```
+
+After a worker finishes, the supervisor no longer relies on the LLM. It reads the latest worker name from the last `AIMessage.name` and applies fixed routing:
+
+| Last worker | Condition | Next node |
+| --- | --- | --- |
+| `researcher_agent` | always | `analyst_agent` |
+| `analyst_agent` | output/state contains `NEEDS_IMPROVEMENT` | `researcher_agent` |
+| `analyst_agent` | output/state contains `APPROVED` | `writer_agent` |
+| `analyst_agent` | no clear status | `__end__` |
+| `writer_agent` | always | `__end__` |
+
+The supervisor also injects a `HumanMessage` named `Supervisor` when handing off to a worker:
+
+```text
+Supervisor Directive: <routing reason>. Please address this.
+```
+
+That directive is visible to the next worker and gives it immediate context for the task.
+
+### `models/state.py`
+
+The graph state is defined as `MultiAgentState`.
+
+```python
+class MultiAgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    research_report: str
+    scraped_data: str
+    document_draft: str
+    approval_status: str
+```
+
+State fields:
+
+| Field | Purpose |
+| --- | --- |
+| `messages` | Full LangChain message history. Uses LangGraph `add_messages`, so new messages append instead of replacing old ones. |
+| `research_report` | Latest researcher summary/report content. |
+| `scraped_data` | Intended location for large scraped payloads. |
+| `document_draft` | Latest writer output. |
+| `approval_status` | Analyst status such as `PENDING`, `APPROVED`, or `NEEDS_IMPROVEMENT`. |
+
+## Worker Contract
+
+Workers are LangGraph ReAct agents created with `create_react_agent`. They do not return plain strings directly to the graph. Each worker returns graph state updates containing new LangChain messages.
+
+Current worker node return shape:
+
+```python
+{
+    "messages": [AIMessage(...), ToolMessage(...), ...],
+    "<optional_state_field>": "..."
+}
+```
+
+The wrapper around each worker tags AI messages:
+
+```python
+AIMessage(
+    content="I have completed the detailed research report...",
+    name="researcher_agent"
+)
+```
+
+This `name` field is important. The supervisor uses it to know which worker just completed a turn.
+
+### Researcher Response
+
+The researcher is responsible for search, scraping, source validation, and research synthesis.
+
+Expected final response style:
+
+```text
+I have completed the research report.
+
+Summary:
+...
+
+Sources:
+- title, url, notes
+
+Known gaps:
+- ...
+```
+
+Graph update:
+
+```python
+{
+    "messages": new_researcher_messages,
+    "research_report": latest_researcher_ai_content
+}
+```
+
+The researcher may call tools many times internally before returning control to the supervisor.
+
+Researcher tools:
+
+- `create_research_strategy`
+- `validate_research_sources`
+- `create_research_report`
+- `analyze_research_completeness`
+- `scrape_webpages`
+- `search_tavily`
+- `search_ddg`
+- `enhanced_search_tavily`
+- `search_wikipedia`
+- `search_arxiv`
+- `search_github`
+- `search_stackoverflow`
+- `get_tool_references`
+
+### Analyst Response
+
+The analyst reviews the research, identifies gaps, and decides whether writing can begin.
+
+Required status language:
+
+```text
+APPROVED
+```
+
+or:
+
+```text
+NEEDS_IMPROVEMENT
+```
+
+Expected final response style:
+
+```text
+Approval Status: NEEDS_IMPROVEMENT
+
+Critique:
+- Missing coverage of ...
+- Source quality concern ...
+
+Recommended follow-up research:
+- Search query ...
+- Source type ...
+```
+
+Graph update:
+
+```python
+{
+    "messages": new_analyst_messages,
+    "approval_status": "APPROVED | NEEDS_IMPROVEMENT | PENDING"
+}
+```
+
+Analyst tools:
+
+- `validate_research_sources`
+- `analyze_research_completeness`
+- `get_tool_references`
+
+### Writer Response
+
+The writer turns approved research into a final document.
+
+Expected final response style:
+
+```text
+Document created.
+
+Location:
+...
+
+Summary:
+...
+
+Quality notes:
+...
+```
+
+Graph update:
+
+```python
+{
+    "messages": new_writer_messages,
+    "document_draft": latest_writer_ai_content
+}
+```
+
+Writer tools:
+
+- `create_structured_document`
+- `generate_research_summary`
+- `validate_document_structure`
+- `create_outline`
+- `read_document`
+- `write_document`
+- `edit_document`
+
+## Tool Call Contract
+
+Tools are exposed to workers as LangChain tools. During a ReAct worker turn, the worker may produce an `AIMessage` with tool calls:
+
+```python
+AIMessage(
+    content="I will use search_github because...",
+    tool_calls=[
+        {
+            "name": "search_github",
+            "args": {"query": "LangGraph checkpointing"},
+            "id": "call_..."
+        }
+    ]
+)
+```
+
+LangGraph executes the tool and appends a matching `ToolMessage`:
+
+```python
+ToolMessage(
+    name="search_github",
+    tool_call_id="call_...",
+    content="..."
+)
+```
+
+The worker continues this loop until it returns an `AIMessage` without tool calls. At that point, the worker node returns control to the supervisor.
+
+## Research Source Schema
+
+Research tools accept source JSON. The preferred flat shape is:
+
+```json
+[
+  {
+    "title": "LangGraph documentation",
+    "url": "https://...",
+    "content": "Relevant source content..."
+  }
+]
+```
+
+Grouped source shape is also accepted:
+
+```json
+[
+  {
+    "source": "GitHub",
+    "details": [
+      {
+        "repo": "langchain-ai/langgraph",
+        "url": "https://github.com/langchain-ai/langgraph",
+        "stars": 32000,
+        "updated": "2026-05-14"
+      }
+    ]
+  }
+]
+```
+
+The research tools normalize grouped records into flat source records before validation and report generation.
+
+## Checkpointing and Memory
+
+The graph is compiled with:
+
+```python
+memory = MemorySaver()
+return builder.compile(checkpointer=memory)
+```
+
+`MemorySaver` stores graph state in process memory by `thread_id`.
+
+Current runtime config:
+
+```python
+config = {
+    "configurable": {"thread_id": "session_1"},
+    "recursion_limit": 20
+}
+```
+
+Important behavior:
+
+- Reusing `"session_1"` means each prompt in the same process sees previous messages.
+- This is useful for conversation continuity.
+- It can confuse routing if old requests remain in the message history.
+- Use a fresh `thread_id` per task if each user request should be isolated.
+- `MemorySaver` is not persistent storage. State disappears when the Python process exits.
+
+## Safety Limits
+
+The supervisor tracks repeated route decisions with `max_consecutive_same`.
+
+If the same worker is selected too many times in a row, the supervisor forces `__end__` to avoid infinite loops.
+
+This is a guardrail, not the main routing mechanism. The main loop prevention comes from deterministic routing after worker completion.
+
+## Logs
+
+Logs are written to:
+
+```text
+logs/multiagent.log
+```
+
+The logging helper records:
+
+- Worker tool choices.
+- Tool arguments.
+- Tool results.
+- Worker AI message previews.
+- Supervisor route reasons.
+- Supervisor route decisions.
+
+Example:
+
+```text
+[RESEARCHER] Tool chosen: search_github | Args: {...}
+[RESEARCHER] Tool result (search_github): ...
+Supervisor deterministic reason: researcher_agent completed its turn...
+Supervisor decision: Routing to -> analyst_agent
+```
 
 ## Project Structure
 
-* **`main.py`**: The entry point. Initializes the graph, sets up Memory Checkpointing, and runs the stream loop.
-* **`models/state.py`**: Contains the `MultiAgentState` schema.
-* **`agents/supervisor.py`**: Contains the `create_supervisor()` factory function and intelligent routing logic.
-* **`tools/`**: 
-  * `web_tools.py` & `enhanced_web_tools.py`: Search engines (Tavily, DDG, Github, arXiv) and safe DOM scraping (try/except wrapped).
-  * `document_tools.py`: Safe atomic file writing tools.
-* **`utils/llm.py`**: Factory for seamless switching between OpenAI and Ollama.
+```text
+.
+├── agents/
+│   └── supervisor.py
+├── models/
+│   ├── research_schemas.py
+│   └── state.py
+├── tools/
+│   ├── document_generator.py
+│   ├── document_tools.py
+│   ├── enhanced_web_tools.py
+│   ├── research_tools.py
+│   └── web_tools.py
+├── utils/
+│   └── llm.py
+├── main.py
+├── mermaid.md
+├── requirements.txt
+└── README.md
+```
 
 ## Getting Started
 
-1. Set up `.env` with API keys (`OPENAI_API_KEY`, `TAVILY_API_KEY`, etc.).
-2. Run the application:
-   ```bash
-   python main.py
-   ```
-3. Logs are generated dynamically in the `logs/multiagent.log` file.
+1. Create and activate a virtual environment.
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Configure `.env` with required keys:
+
+```text
+OPENAI_API_KEY=...
+AI_PROVIDER=...
+TAVILY_API_KEY=...
+```
+
+4. Run the app:
+
+```bash
+python main.py
+```
+
+## Recommended Next Improvements
+
+- Make analyst output a strict Pydantic schema instead of plain text status matching.
+- Add `missing_topics`, and `recommended_queries` to `MultiAgentState`.
+- Add `research_iterations` to state and cap follow-up research cycles.
+- Use a fresh `thread_id` for each unrelated user task.
+- Move large scraped text out of `messages` and into state fields or external storage.

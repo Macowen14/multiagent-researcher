@@ -1,8 +1,10 @@
 import os
 import getpass
 import logging
+import json
+import uuid
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.graph import StateGraph, START
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage
@@ -26,15 +28,6 @@ from tools.research_tools import (
     create_research_report,
     analyze_research_completeness,
 )
-from models.research_schemas import (
-    ResearchStrategy,
-    ResearchReport,
-    AnalysisReport,
-    ValidationResponse,
-    SearchToolType,
-    ContentType,
-    ResearchQuality,
-)
 from tools.document_tools import (
     create_outline,
     read_document,
@@ -51,10 +44,7 @@ from tools.document_generator import (
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("logs/multiagent.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("logs/multiagent.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -94,14 +84,17 @@ def build_graph():
         "The 'analyst_agent' is responsible for analyzing research, identifying gaps, and planning next steps. "
         "The 'writer_agent' is responsible for creating outlines and editing documents. "
         "\nINTELLIGENT ROUTING STRATEGY:\n"
-        "1. For ALL new research requests, you MUST route to 'researcher_agent' first.\n"
+        "1. If no agent has acted yet on the user's request, you MUST route to 'researcher_agent' first.\n"
         "2. Do NOT route to 'writer_agent' or 'analyst_agent' initially.\n"
         "3. Once 'researcher_agent' has provided data, route to 'analyst_agent' for review.\n"
         "4. ONLY route to 'writer_agent' once 'analyst_agent' has explicitly approved the research.\n"
         "5. If 'analyst_agent' finds gaps, route back to 'researcher_agent'.\n\n"
         "Given the conversation history and the user's request, decide which worker "
         "should act next to make progress. Each worker will perform a task and return results. "
-        "If the user's request has been completely fulfilled, route to __end__."
+        "If the user's request has been completely fulfilled, route to __end__. "
+        "If the last message from a worker indicates they have successfully completed "
+        "their task or generated a report, you MUST route to the next agent in the "
+        "pipeline or to end. Do NOT route back to the same worker."
     )
     supervisor_node = create_supervisor(
         llm=llm, members=MEMBERS, system_prompt=supervisor_prompt
@@ -157,6 +150,16 @@ def build_graph():
             "6. Include confidence scores and quality assessments\n"
             "7. Identify and explicitly state research gaps\n"
             "8. Provide specific recommendations for additional research\n\n"
+            "At the end of your task, you MUST output a JSON code block containing your final status.\n"
+            "Format exactly like this:\n"
+            "```json\n"
+            "{\n"
+            "  \"status\": \"COMPLETED\",\n"
+            "  \"next\": \"analyst_agent\",\n"
+            "  \"summary\": \"Brief summary of your research findings\",\n"
+            "  \"gaps\": [\"any gaps you couldn't fill\"]\n"
+            "}\n"
+            "```\n\n"
             "QUALITY STANDARDS:\n"
             "- Minimum 5 high-quality sources per topic\n"
             "- Source diversity (academic, practical, documentation)\n"
@@ -201,6 +204,15 @@ def build_graph():
             "4. **Professional formatting** - Consistent markdown structure\n"
             "5. **Comprehensive references** - Complete citation lists\n"
             "6. **Quality validation** - Ensure document meets standards\n\n"
+            "At the end of your task, you MUST output a JSON code block containing your final status.\n"
+            "Format exactly like this:\n"
+            "```json\n"
+            "{\n"
+            "  \"status\": \"COMPLETED\",\n"
+            "  \"next\": \"__end__\",\n"
+            "  \"summary\": \"Brief summary of document created\"\n"
+            "}\n"
+            "```\n\n"
             "OUTPUT STANDARDS:\n"
             "- Executive summary with key findings\n"
             "- Detailed methodology and approach\n"
@@ -242,6 +254,15 @@ def build_graph():
             "3. **Cross-Validation**: Information corroborated by multiple sources\n"
             "4. **Recency**: Current information when relevant\n"
             "5. **Attribution**: Proper source citation and references\n\n"
+            "At the end of your task, you MUST output a JSON code block containing your final status.\n"
+            "Format exactly like this:\n"
+            "```json\n"
+            "{\n"
+            "  \"approval_status\": \"APPROVED\" or \"NEEDS_IMPROVEMENT\",\n"
+            "  \"missing_topics\": [\"topic1\", \"topic2\"],\n"
+            "  \"recommended_queries\": [\"query1\", \"query2\"]\n"
+            "}\n"
+            "```\n\n"
             "OUTPUT REQUIREMENTS:\n"
             "- Use structured analysis with clear scoring\n"
             "- Provide specific recommendations for improvement\n"
@@ -279,27 +300,107 @@ def build_graph():
                     f"[{node_name}] 📦 Tool result ({msg.name}): {result_preview}..."
                 )
 
+    def _tag_worker_messages(worker_name: str, new_messages):
+        """Mark worker AI responses so the supervisor can route from the latest actor."""
+        tagged_messages = []
+        for msg in new_messages:
+            if getattr(msg, "type", None) == "ai":
+                tagged_messages.append(msg.model_copy(update={"name": worker_name}))
+            else:
+                tagged_messages.append(msg)
+        return tagged_messages
+
+    def _latest_ai_content(messages) -> str:
+        for msg in reversed(messages):
+            if getattr(msg, "type", None) == "ai" and msg.content:
+                return str(msg.content)
+        return ""
+
+    def _extract_json_block(text: str) -> dict:
+        import re
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except:
+                pass
+        return {}
+
     # Helper function to extract just the new messages from the prebuilt agent's state
     def researcher_node(state: MultiAgentState):
-        existing_count = len(state["messages"])
-        result = researcher_agent.invoke(state)
-        new_msgs = result["messages"][existing_count:]
+        messages = list(state["messages"])
+        
+        # If the analyst sent us back, explicitly consume their critique as a directive
+        if state.get("approval_status") == "NEEDS_IMPROVEMENT" and state.get("analysis_report"):
+            try:
+                critique = json.loads(state["analysis_report"])
+                directive = (
+                    "ANALYST CRITIQUE - PLEASE ADDRESS THESE GAPS:\n"
+                    f"Missing Topics: {critique.get('missing_topics', [])}\n"
+                    f"Recommended Queries: {critique.get('recommended_queries', [])}\n"
+                    "Focus strictly on finding this missing information."
+                )
+                messages.append(HumanMessage(content=directive, name="Analyst"))
+            except Exception:
+                pass
+                
+        existing_count = len(messages)
+        result = researcher_agent.invoke({"messages": messages})
+        new_msgs = _tag_worker_messages(RESEARCHER, result["messages"][existing_count:])
         _log_new_messages("RESEARCHER", new_msgs)
-        return {"messages": new_msgs}
+        
+        latest_content = _latest_ai_content(new_msgs)
+        parsed_json = _extract_json_block(latest_content)
+        
+        return {
+            "messages": new_msgs,
+            "research_report": json.dumps(parsed_json) if parsed_json else latest_content,
+        }
 
     def writer_node(state: MultiAgentState):
         existing_count = len(state["messages"])
         result = writer_agent.invoke(state)
-        new_msgs = result["messages"][existing_count:]
+        new_msgs = _tag_worker_messages(WRITER, result["messages"][existing_count:])
         _log_new_messages("WRITER", new_msgs)
-        return {"messages": new_msgs}
+        return {
+            "messages": new_msgs,
+            "document_draft": _latest_ai_content(new_msgs),
+        }
 
     def analyst_node(state: MultiAgentState):
         existing_count = len(state["messages"])
         result = analyst_agent.invoke(state)
-        new_msgs = result["messages"][existing_count:]
+        new_msgs = _tag_worker_messages(ANALYST, result["messages"][existing_count:])
         _log_new_messages("ANALYST", new_msgs)
-        return {"messages": new_msgs}
+        
+        latest_analysis = _latest_ai_content(new_msgs)
+        parsed_json = _extract_json_block(latest_analysis)
+        
+        approval_status = parsed_json.get("approval_status", "PENDING")
+        if not parsed_json: # Fallback if JSON parse failed
+            if "NEEDS_IMPROVEMENT" in latest_analysis:
+                approval_status = "NEEDS_IMPROVEMENT"
+            elif "APPROVED" in latest_analysis:
+                approval_status = "APPROVED"
+                
+        iterations = state.get("research_iterations", 0)
+        
+        if approval_status == "NEEDS_IMPROVEMENT":
+            iterations += 1
+            if iterations >= 3:
+                # Force approval after max revisions to avoid infinite loops
+                approval_status = "APPROVED"
+                logger.warning("Max research iterations (3) reached. Forcing route to WRITER.")
+                if parsed_json:
+                    parsed_json["approval_status"] = "APPROVED"
+                    parsed_json["system_note"] = "Forced approval due to max revisions limit."
+
+        return {
+            "messages": new_msgs,
+            "analysis_report": json.dumps(parsed_json) if parsed_json else latest_analysis,
+            "approval_status": approval_status,
+            "research_iterations": iterations,
+        }
 
     # 5. Build the Graph
     builder = StateGraph(MultiAgentState)
@@ -334,12 +435,16 @@ if __name__ == "__main__":
             if not user_input:
                 continue
 
-            if user_input.lower() in ["exit", "quit"]:
+            if user_input.lower() in ["exit", "quit", "\\c", "\\q"]:
                 print("Exiting application. Goodbye!")
                 break
 
             logger.info("Starting new workflow...")
-            config = {"configurable": {"thread_id": "session_1"}, "recursion_limit": 20}
+            
+            # Use a fresh thread_id for each new request
+            thread_id = uuid.uuid4().hex
+            config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 20}
+            
             for step in app.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=config,
