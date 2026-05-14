@@ -1,35 +1,43 @@
 # Multi-Agent Web Research & Writing System
 
-This project is a highly robust, LangGraph-based multi-agent application. It uses an **Intelligent Supervisor** architecture to orchestrate three specialized workers: a **Researcher Agent**, an **Analyst Agent**, and a **Writer Agent**.
+This project is a highly robust, production-ready multi-agent application built on the **LangGraph** framework. It implements a **Hierarchical Supervisor Routing Architecture** where a central LLM orchestrates specialized sub-agents (ReAct worker nodes) using strictly typed Pydantic models, custom state management, and memory checkpointing.
+
+## Architectural Deep Dive
+
+### 1. State Management (`MultiAgentState`)
+The application uses a custom `TypedDict` for its graph state (defined in `models/state.py`).
+- **`messages`**: A list of LangChain `BaseMessage` objects (`HumanMessage`, `AIMessage`, `ToolMessage`). This is managed by the LangGraph `add_messages` reducer which automatically appends new messages rather than overwriting them.
+- **Data Fields**: Custom fields like `scraped_data`, `research_report`, and `approval_status` are defined to decouple large data payloads from the conversational chat history, drastically reducing token usage and preventing `ContextWindowExceeded` errors.
+
+### 2. The Supervisor Node
+Located in `agents/supervisor.py`, the Supervisor acts as the routing brain. 
+- **Silent/Loud Routing**: The Supervisor reads the `MultiAgentState`, applies rules from its System Prompt, and uses `llm.with_structured_output` to force the generation of a JSON `Route` object. It does not execute tools.
+- **Explicit Handoffs**: To solve "Identity Confusion" between agents, the Supervisor injects a `HumanMessage` named "Supervisor" into the state before routing. This explicit directive ensures the worker knows exactly what to fix.
+- **State Filtering**: Before invoking the LLM, the Supervisor filters out large `ToolMessage` payloads (e.g., massive scraped HTML) replacing them with summaries. This preserves the context window.
+
+### 3. Worker Nodes (ReAct Agents)
+The Researcher, Analyst, and Writer are implemented via LangGraph's `create_react_agent`.
+- **Execution Loop**: Workers execute internal `while tool_calls` loops. They parse tool output, decide on the next tool, and aggregate data. They only return control to the Supervisor when they generate an `AIMessage` without a tool call.
+- **Tool Binding**: Tools are defined using the `@tool` decorator or Pydantic `BaseModel`s. LangChain compiles these into JSON schemas sent to the LLM (OpenAI/Ollama).
+
+### 4. Checkpointing and Memory
+The `StateGraph` is compiled with `MemorySaver()`. In `main.py`, the `app.stream()` execution is bound to a `thread_id`. This grants the multi-agent system thread-level persistent memory, allowing conversational continuity across multiple user prompts.
 
 ## Project Structure
 
-* **`main.py`**: The entry point that sets up the LangGraph state graph, initializes the LLM, connects the agents, and runs an interactive streaming loop for processing user requests and logging operations.
-* **`agents/supervisor.py`**: Contains a highly reusable factory function `create_supervisor()`. This node uses Pydantic schemas and `with_structured_output` to physically restrict the LLM to only make valid routing decisions, demanding reasoning and enforcing safety limits.
-* **`tools/web_tools.py`**: A suite of tools for extracting information from the web:
-  * `search_tavily`, `search_ddg`, `scrape_webpages`
-* **`tools/enhanced_web_tools.py`**: Advanced domain-specific search integrations:
-  * `enhanced_search_tavily`, `search_wikipedia`, `search_arxiv`, `search_github`, `search_stackoverflow`, `get_tool_references`
-* **`tools/document_tools.py`**: A suite of tools for writing to the local filesystem:
-  * `create_outline`, `write_document`, `read_document`, `edit_document`
-* **`utils/util.py`**: A custom utility script that handles **Atomic File Locking**.
-* **`utils/llm.py`**: An LLM factory pattern supporting OpenAI and Ollama.
-
-## How the Agents Work Together
-
-1. **Supervisor Node**: The "Brain" of the operation. It dynamically routes tasks between agents using an intelligent strategy:
-   - *New requests* go to the Researcher.
-   - *Completed research* goes to the Analyst.
-   - *Approved analysis* goes to the Writer.
-   - *Insufficient research* routes back to the Researcher.
-2. **Researcher Agent**: Equipped with diverse web and academic tools. It performs deep, exhaustive searches across Wikipedia, arXiv, GitHub, and general search engines.
-3. **Analyst Agent**: The quality controller. It reviews the research for gaps, ensures proper source attribution, and plans the document structure.
-4. **Writer Agent**: The content creator. Organizes the finalized research and safely writes it to the local filesystem.
+* **`main.py`**: The entry point. Initializes the graph, sets up Memory Checkpointing, and runs the stream loop.
+* **`models/state.py`**: Contains the `MultiAgentState` schema.
+* **`agents/supervisor.py`**: Contains the `create_supervisor()` factory function and intelligent routing logic.
+* **`tools/`**: 
+  * `web_tools.py` & `enhanced_web_tools.py`: Search engines (Tavily, DDG, Github, arXiv) and safe DOM scraping (try/except wrapped).
+  * `document_tools.py`: Safe atomic file writing tools.
+* **`utils/llm.py`**: Factory for seamless switching between OpenAI and Ollama.
 
 ## Getting Started
 
-1. Make sure your `.env` has the necessary keys (e.g. `OPENAI_API_KEY`, `TAVILY_API_KEY`).
+1. Set up `.env` with API keys (`OPENAI_API_KEY`, `TAVILY_API_KEY`, etc.).
 2. Run the application:
    ```bash
    python main.py
    ```
+3. Logs are generated dynamically in the `logs/multiagent.log` file.

@@ -39,7 +39,9 @@ class LLMFactory:
             from langchain_ollama import ChatOllama
 
             # Default to llama3 if no model is explicitly passed or set in environment
-            model = model_name or os.getenv("OLLAMA_MODEL", "llama3")
+            model = model_name or os.getenv(
+                "OLLAMA_MODEL", "mistral-large-3:675b-cloud"
+            )
             logger.info(f"Initializing Ollama LLM with model: {model}")
 
             # Note: Ensure you have your local Ollama instance running

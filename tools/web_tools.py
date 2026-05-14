@@ -17,14 +17,18 @@ def scrape_webpages(urls: List[str]) -> str:
     """Use WebBaseLoader to scrape the content of the provided URLs and return the combined text."""
     logger.info(f"Scraping webpages: {urls}")
 
-    loader = WebBaseLoader(urls)
-    documents = loader.load()
-    logger.info(f"Loaded {len(documents)} documents from the provided URLs.")
+    try:
+        loader = WebBaseLoader(urls)
+        documents = loader.load()
+        logger.info(f"Loaded {len(documents)} documents from the provided URLs.")
 
-    # Join with double newline to keep pages distinct
-    content = "\n\n".join([doc.page_content for doc in documents])
-    logger.info("Webpage scraping complete.")
-    return content
+        # Join with double newline to keep pages distinct
+        content = "\n\n".join([doc.page_content for doc in documents])
+        logger.info("Webpage scraping complete.")
+        return content
+    except Exception as e:
+        logger.error(f"Error scraping webpages: {e}")
+        return f"ToolError: Failed to scrape {urls}. The website might block scrapers or the URLs are invalid. Please try a different tool or source. Details: {str(e)}"
 
 
 @tool(

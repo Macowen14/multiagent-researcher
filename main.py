@@ -4,7 +4,10 @@ import logging
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, MessagesState, START
 from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage
+
+from models.state import MultiAgentState
 
 from utils.llm import LLMFactory
 from agents.supervisor import create_supervisor
@@ -46,7 +49,12 @@ from tools.document_generator import (
 
 # Setup Logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("logs/multiagent.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -272,21 +280,21 @@ def build_graph():
                 )
 
     # Helper function to extract just the new messages from the prebuilt agent's state
-    def researcher_node(state: MessagesState):
+    def researcher_node(state: MultiAgentState):
         existing_count = len(state["messages"])
         result = researcher_agent.invoke(state)
         new_msgs = result["messages"][existing_count:]
         _log_new_messages("RESEARCHER", new_msgs)
         return {"messages": new_msgs}
 
-    def writer_node(state: MessagesState):
+    def writer_node(state: MultiAgentState):
         existing_count = len(state["messages"])
         result = writer_agent.invoke(state)
         new_msgs = result["messages"][existing_count:]
         _log_new_messages("WRITER", new_msgs)
         return {"messages": new_msgs}
 
-    def analyst_node(state: MessagesState):
+    def analyst_node(state: MultiAgentState):
         existing_count = len(state["messages"])
         result = analyst_agent.invoke(state)
         new_msgs = result["messages"][existing_count:]
@@ -294,7 +302,7 @@ def build_graph():
         return {"messages": new_msgs}
 
     # 5. Build the Graph
-    builder = StateGraph(MessagesState)
+    builder = StateGraph(MultiAgentState)
 
     # Add nodes
     builder.add_node("supervisor", supervisor_node)
@@ -309,7 +317,8 @@ def build_graph():
     builder.add_edge(WRITER, "supervisor")
     builder.add_edge(ANALYST, "supervisor")
 
-    return builder.compile()
+    memory = MemorySaver()
+    return builder.compile(checkpointer=memory)
 
 
 if __name__ == "__main__":
@@ -330,9 +339,10 @@ if __name__ == "__main__":
                 break
 
             logger.info("Starting new workflow...")
+            config = {"configurable": {"thread_id": "session_1"}, "recursion_limit": 20}
             for step in app.stream(
                 {"messages": [HumanMessage(content=user_input)]},
-                config={"recursion_limit": 20},
+                config=config,
             ):
                 for node_name, state_update in step.items():
                     logger.info(f"Node '{node_name.upper()}' completed its task.")
