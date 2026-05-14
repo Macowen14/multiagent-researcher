@@ -4,3 +4,4 @@ venv/
 *.pyc
 temp/
 
+logs/

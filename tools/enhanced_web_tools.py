@@ -175,7 +175,9 @@ def search_github(
         
         formatted_results = []
         for repo in data["items"]:
-            description = repo.get("description", "No description available")
+            description = repo.get("description")
+            if description is None:
+                description = "No description available"
             description = description[:200] + "..." if len(description) > 200 else description
             
             formatted_results.append(
